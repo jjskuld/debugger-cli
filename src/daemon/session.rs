@@ -323,15 +323,10 @@ impl DebugSession {
             .take_event_receiver()
             .ok_or_else(|| Error::Internal("Failed to get event receiver".to_string()))?;
 
-        // Initial state: Stopped if stop_on_entry requested, otherwise Running
-        // Note: If initial breakpoints are set, the program will stop when it hits them
-        let initial_state = if stop_on_entry {
-            SessionState::Stopped
-        } else {
-            SessionState::Running
-        };
+        // Initial state: always Running initially, wait_settled will catch the Stopped event if it stops on entry
+        let initial_state = SessionState::Running;
 
-        Ok(Self {
+        let mut session = Self {
             client,
             events_rx,
             state: initial_state,
@@ -357,7 +352,11 @@ impl DebugSession {
             current_output_bytes: 0,
             exit_code: None,
             dap_request_timeout: request_timeout,
-        })
+        };
+        
+        // Wait for state to settle (e.g. catch Stopped event if stop_on_entry is true)
+        session.wait_settled().await?;
+        Ok(session)
     }
 
     /// Create a new debug session by attaching to a process
@@ -414,7 +413,7 @@ impl DebugSession {
             .take_event_receiver()
             .ok_or_else(|| Error::Internal("Failed to get event receiver".to_string()))?;
 
-        Ok(Self {
+        let mut session = Self {
             client,
             events_rx,
             state: SessionState::Stopped, // Attached processes start stopped
@@ -440,7 +439,10 @@ impl DebugSession {
             current_output_bytes: 0,
             exit_code: None,
             dap_request_timeout: request_timeout,
-        })
+        };
+        
+        session.wait_settled().await?;
+        Ok(session)
     }
 
     /// Get current state
@@ -658,6 +660,41 @@ impl DebugSession {
                     // Timeout elapsed
                     return Err(Error::AwaitTimeout(timeout_secs));
                 }
+            }
+        }
+    }
+
+    /// Wait briefly for the daemon state to settle after a state-changing command
+    /// (e.g. continue, step, restart) before returning to the CLI.
+    /// This prevents race conditions where rapid commands (e.g. `restart && continue`)
+    /// are issued before the DAP adapter has emitted its events.
+    pub async fn wait_settled(&mut self) -> Result<()> {
+        let timeout = std::time::Duration::from_millis(150);
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // If it hasn't stopped within the timeout, assume it settled in Running state
+                return Ok(());
+            }
+
+            match tokio::time::timeout(remaining, self.events_rx.recv()).await {
+                Ok(Some(event)) => {
+                    self.handle_event(&event);
+
+                    match &event {
+                        Event::Stopped(_) | Event::Exited(_) | Event::Terminated(_) => {
+                            // Settled in a stopped/terminal state
+                            return Ok(());
+                        }
+                        _ => {
+                            // Continue processing events
+                        }
+                    }
+                }
+                Ok(None) => return Err(Error::AdapterCrashed),
+                Err(_) => return Ok(()), // Timeout elapsed, settled
             }
         }
     }
@@ -921,6 +958,9 @@ impl DebugSession {
 
     /// Continue execution
     pub async fn continue_execution(&mut self) -> Result<()> {
+        if self.state == SessionState::Running {
+            return Ok(()); // Already running
+        }
         self.ensure_stopped()?;
 
         // Process any pending events before sending continue request
@@ -1127,6 +1167,7 @@ impl DebugSession {
         self.current_frame = None;
         self.current_frame_index = 0;
         self.cached_frames.clear();
+        self.wait_settled().await?;
         Ok(())
     }
 
